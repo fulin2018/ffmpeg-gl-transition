@@ -66,13 +66,15 @@ static const GLchar *f_shader_template =
   "uniform float ratio;\n"
   "uniform float _fromR;\n"
   "uniform float _toR;\n"
+  "uniform float _fromStride;\n"
+  "uniform float _toStride;\n"
   "\n"
   "vec4 getFromColor(vec2 uv) {\n"
-  "  return texture2D(from, vec2(uv.x, 1.0 - uv.y));\n"
+  "  return texture2D(from, vec2(uv.x*_fromStride, 1.0 - uv.y));\n"
   "}\n"
   "\n"
   "vec4 getToColor(vec2 uv) {\n"
-  "  return texture2D(to, vec2(uv.x, 1.0 - uv.y));\n"
+  "  return texture2D(to, vec2(uv.x*_toStride, 1.0 - uv.y));\n"
   "}\n"
   "\n"
   "\n%s\n"
@@ -109,10 +111,15 @@ typedef struct {
   GLint         ratio;
   GLint         _fromR;
   GLint         _toR;
-
+  GLint         _fromStride;
+  GLint         _toStride;
+  GLfloat       fromStride;
+  GLfloat       toStride;
   // internal state
   GLuint        posBuf;
   GLuint        program;
+  unsigned char*  pImageBuf;
+  GLuint          imageBufSize;
 #ifdef GL_TRANSITION_USING_EGL
   EGLDisplay eglDpy;
   EGLConfig eglCfg;
@@ -277,9 +284,17 @@ static void setup_uniforms(AVFilterLink *fromLink)
   c->_fromR = glGetUniformLocation(c->program, "_fromR");
   glUniform1f(c->_fromR, fromLink->w / (float)fromLink->h);
 
+  c->_fromStride = glGetUniformLocation(c->program, "_fromStride");
+  c->fromStride = 1.;
+  glUniform1f(c->_fromStride, 1.);
+  
   // TODO: initialize this in config_props for "to" input
   c->_toR = glGetUniformLocation(c->program, "_toR");
   glUniform1f(c->_toR, fromLink->w / (float)fromLink->h);
+
+  c->_toStride = glGetUniformLocation(c->program, "_toStride");
+  c->toStride = 1.;
+  glUniform1f(c->_toStride, 1.);
 }
 
 static int setup_gl(AVFilterLink *inLink)
@@ -370,7 +385,48 @@ static AVFrame *apply_transition(FFFrameSync *fs,
   glfwMakeContextCurrent(c->window);
 #endif
 
+  ptrdiff_t from_width = fromFrame->linesize[0]/3;
+  ptrdiff_t to_width   = toFrame->linesize[0]/3;
+  ptrdiff_t out_width  = outFrame->linesize[0]/3;
   glUseProgram(c->program);
+
+  float fromStride = fromLink->w * 1. / from_width;
+  float toStride =  toLink->w * 1. / to_width;
+
+  //if( fabs(fromStride - c->fromStride) > 0.000001 )
+  {
+      c->fromStride = fromStride;
+      glUniform1f(c->_fromStride, fromStride);
+  }
+  //if( fabs(toStride - c->toStride) > 0.000001 )
+  {
+      c->toStride = toStride;
+      glUniform1f(c->_toStride, toStride);
+  }
+
+  unsigned char* pOutBuffer = outFrame->data[0];
+  int outBufferStride = outLink->w*3;
+  if( outBufferStride != outFrame->linesize[0])
+  {
+    if( c->pImageBuf == NULL || c->imageBufSize < outBufferStride * outLink->h)
+    {
+        if (c->pImageBuf)
+        {
+          free(c->pImageBuf);
+          c->pImageBuf = NULL;
+        }
+        c->pImageBuf = (unsigned char*)malloc(outBufferStride * outLink->h);
+        if ( c->pImageBuf == NULL)
+        {
+          av_frame_free(&fromFrame);
+          return NULL;
+        }
+        c->imageBufSize = outBufferStride * outLink->h ;
+    }
+    pOutBuffer = c->pImageBuf;
+  }
+
+  //fprintf(stderr, "stride=%d:%f %d:%f out = %d\n", c->_fromStride, c->fromStride, c->_toStride, c->toStride, outFrame->linesize[0]);
 
   const float ts = ((fs->pts - c->first_pts) / (float)fs->time_base.den) - c->offset;
   const float progress = FFMAX(0.0f, FFMIN(1.0f, ts / c->duration));
@@ -379,14 +435,26 @@ static AVFrame *apply_transition(FFFrameSync *fs,
 
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, c->from);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, fromLink->w, fromLink->h, 0, PIXEL_FORMAT, GL_UNSIGNED_BYTE, fromFrame->data[0]);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, from_width, fromLink->h, 0, PIXEL_FORMAT, GL_UNSIGNED_BYTE, fromFrame->data[0]);
 
   glActiveTexture(GL_TEXTURE0 + 1);
   glBindTexture(GL_TEXTURE_2D, c->to);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, toLink->w, toLink->h, 0, PIXEL_FORMAT, GL_UNSIGNED_BYTE, toFrame->data[0]);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, to_width, toLink->h, 0, PIXEL_FORMAT, GL_UNSIGNED_BYTE, toFrame->data[0]);
 
   glDrawArrays(GL_TRIANGLES, 0, 6);
-  glReadPixels(0, 0, outLink->w, outLink->h, PIXEL_FORMAT, GL_UNSIGNED_BYTE, (GLvoid *)outFrame->data[0]);
+  glReadPixels(0, 0, outLink->w, outLink->h, PIXEL_FORMAT, GL_UNSIGNED_BYTE, (GLvoid *)pOutBuffer);
+  
+  if( out_width != outLink->w)
+  {
+      unsigned char* pSrc = pOutBuffer;
+      unsigned char* pDst = outFrame->data[0];
+      for( int i = 0; i < outLink->h; i++)
+      {
+          memcpy(pDst, pSrc, outBufferStride);
+          pDst += outFrame->linesize[0];
+          pSrc += outBufferStride;
+      }
+  }
 
   av_frame_free(&fromFrame);
 
@@ -427,7 +495,8 @@ static av_cold int init(AVFilterContext *ctx)
   GLTransitionContext *c = ctx->priv;
   c->fs.on_event = blend_frame;
   c->first_pts = AV_NOPTS_VALUE;
-
+  c->pImageBuf = 0;
+  c->imageBufSize = 0;
 
 #ifndef GL_TRANSITION_USING_EGL
   if (!glfwInit())
@@ -460,7 +529,13 @@ static av_cold void uninit(AVFilterContext *ctx) {
     glfwDestroyWindow(c->window);
   }
 #endif
-
+  if (c->pImageBuf)
+  {
+    free(c->pImageBuf);
+    c->pImageBuf = 0;
+    c->imageBufSize = 0;
+  }
+  
   if (c->f_shader_source) {
     av_freep(&c->f_shader_source);
   }
