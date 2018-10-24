@@ -79,7 +79,7 @@ pkg install xorg-vfbserver (FreeBSD)
 apt install xvfb (Ubuntu)
 
 Xvfb :1 -screen 0 1280x1024x16
-export DISPLAY=:99
+export DISPLAY=:1
 ```
 
 ### Building ffmpeg
